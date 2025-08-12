@@ -1,3 +1,5 @@
+import 'dart:developer';
+
 import 'package:flutter/material.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
@@ -9,14 +11,18 @@ void main() {
 }
 
 class MyApp extends StatefulWidget {
-  const MyApp({super.key});
+  const MyApp({Key? key}) : super(key: key);
 
   @override
   State<MyApp> createState() => _MyAppState();
 }
 
 class _MyAppState extends State<MyApp> {
-  bool _amplifyConfigured = false;
+  final _otpController = TextEditingController();
+  String _authState = 'Signed Out';
+  String _accessToken = '';
+  final _amplify = Amplify;
+  final _amplifyAuth = Amplify.Auth;
 
   @override
   void initState() {
@@ -27,58 +33,184 @@ class _MyAppState extends State<MyApp> {
   Future<void> _configureAmplify() async {
     try {
       final auth = AmplifyAuthCognito();
-      await Amplify.addPlugin(auth);
-      await Amplify.configure(amplifyconfig);
-      setState(() => _amplifyConfigured = true);
-    } on AmplifyAlreadyConfiguredException {
-      setState(() => _amplifyConfigured = true); // okay if already configured
-    } catch (e) {
-      print('Error configuring Amplify: $e');
+      await _amplify.addPlugin(auth);
+      await _amplify.configure(amplifyconfig);
+      safePrint('Successfully configured Amplify');
+      await _checkAuthState();
+    } on AmplifyException catch (e) {
+      safePrint('Error configuring Amplify: $e');
+    }
+  }
+
+  Future<void> _checkAuthState() async {
+    try {
+      final session = await _amplifyAuth.fetchAuthSession();
+      if (session.isSignedIn) {
+        final cognitoSession = session as CognitoAuthSession;
+        final accessToken =
+            cognitoSession.userPoolTokensResult.value.accessToken.raw;
+        setState(() {
+          _authState = 'Signed In';
+          _accessToken = accessToken;
+        });
+      } else {
+        setState(() {
+          _authState = 'Signed Out';
+          _accessToken = '';
+        });
+      }
+    } on AuthException catch (e) {
+      safePrint('Failed to check auth session: $e');
+      setState(() {
+        _authState = 'Signed Out';
+        _accessToken = '';
+      });
+    }
+  }
+
+  Future<void> _signInWithHostedUI() async {
+    try {
+      final result = await _amplifyAuth.signInWithWebUI();
+      log(
+        "button tapped!! ${result.isSignedIn}  ${result.nextStep}",
+      );
+      if (result.isSignedIn) {
+        final cognitoSession =
+            await _amplifyAuth.fetchAuthSession() as CognitoAuthSession;
+        final accessToken =
+            cognitoSession.userPoolTokensResult.value.accessToken.raw;
+        setState(() {
+          _authState = 'Signed In';
+          _accessToken = accessToken;
+        });
+        safePrint('Sign in successful');
+      } else if (result.nextStep.signInStep ==
+          'CONTINUE_SIGN_IN_WITH_CUSTOM_AUTH_CHALLENGE') {
+        // This is the key step. After the initial hosted UI login, we are
+        // challenged with our custom auth flow (the OTP).
+        setState(() {
+          _authState = 'OTP Required';
+        });
+        safePrint('OTP challenge required');
+      }
+    } on AuthException catch (e) {
+      safePrint('Error signing in: $e');
+      setState(() {
+        _authState = 'Sign In Failed';
+      });
+    }
+  }
+
+  Future<void> _confirmOtp() async {
+    try {
+      final otp = _otpController.text.trim();
+      if (otp.isEmpty) return;
+
+      final result = await _amplifyAuth.confirmSignIn(confirmationValue: otp);
+
+      if (result.isSignedIn) {
+        final cognitoSession =
+            await _amplifyAuth.fetchAuthSession() as CognitoAuthSession;
+        final accessToken =
+            cognitoSession.userPoolTokensResult.value.accessToken.raw;
+        setState(() {
+          _authState = 'Signed In';
+          _accessToken = accessToken;
+        });
+        safePrint('OTP confirmed and sign-in successful');
+      } else {
+        safePrint(
+          'OTP confirmation failed, next step: ${result.nextStep.signInStep}',
+        );
+        setState(() {
+          _authState = 'OTP Failed';
+        });
+      }
+    } on AuthException catch (e) {
+      safePrint('Error confirming OTP: $e');
+      setState(() {
+        _authState = 'OTP Failed';
+      });
+    }
+  }
+
+  Future<void> _signOut() async {
+    try {
+      await _amplifyAuth.signOut();
+      setState(() {
+        _authState = 'Signed Out';
+        _accessToken = '';
+      });
+      safePrint('Signed out successfully');
+    } on AuthException catch (e) {
+      safePrint('Error signing out: $e');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AWS Hosted UI Demo',
       home: Scaffold(
-        appBar: AppBar(title: const Text('Login')),
-        body: Center(
+        appBar: AppBar(title: const Text('Cognito Custom Auth Flow')),
+        body: Padding(
+          padding: const EdgeInsets.all(16.0),
           child: Column(
-            children: [
-              _amplifyConfigured
-                  ? ElevatedButton(
-                      onPressed: _signInWithWebUI,
-                      child: const Text("Sign In with AWS Hosted UI"),
-                    )
-                  : const CircularProgressIndicator(),
-
-              ElevatedButton(
-                onPressed: _signOut,
-                child: const Text("Sign out"),
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text(
+                'Authentication State: $_authState',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 18),
               ),
+              const SizedBox(height: 20),
+              if (_authState == 'Signed Out' || _authState == 'Sign In Failed')
+                ElevatedButton(
+                  onPressed: _signInWithHostedUI,
+                  child: const Text('Sign In with Hosted UI'),
+                ),
+              if (_authState == 'OTP Required' ||
+                  _authState == 'OTP Failed') ...[
+                const Text(
+                  'An OTP has been sent to your email/phone. Please enter it below.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _otpController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Enter OTP',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: _confirmOtp,
+                  child: const Text('Confirm OTP'),
+                ),
+              ],
+              if (_authState == 'Signed In') ...[
+                const Text(
+                  'You are successfully signed in!',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  'Access Token: $_accessToken',
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 10),
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: _signOut,
+                  child: const Text('Sign Out'),
+                ),
+              ],
             ],
           ),
         ),
       ),
     );
-  }
-
-  Future<void> _signInWithWebUI() async {
-    try {
-      final result = await Amplify.Auth.signInWithWebUI();
-      print('Sign-in success: ${result.isSignedIn}');
-    } on AuthException catch (e) {
-      print('Sign-in failed: ${e.message}');
-    }
-  }
-
-  Future<void> _signOut() async {
-    try {
-      await Amplify.Auth.signOut();
-      print('User signed out successfully');
-    } on AuthException catch (e) {
-      print('Sign out failed: ${e.message}');
-    }
   }
 }
